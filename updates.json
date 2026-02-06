@@ -1,5 +1,6 @@
 {
   "release_url": "https://github.com/METABYTECODE/athenabot/releases/download/v1.0/BotGUI.exe",
+  "config_url": "https://github.com/METABYTECODE/athenabot/releases/download/v1.0/config.json",
   "version": "1.0",
   "keys": {
     "ATHENA-DEMO-1234-5678": 1738368000,
