@@ -1,376 +1,306 @@
-# Формула урона героя (vscripts)
+# Формула урона (vscripts)
 
-Документация по расчёту урона: база атаки, крит, физ/маг урон, множители. Источник: `mechanics/damage_system.lua`, `modifiers/eom_modifier/properties.lua`, `modifiers/modifier_hero_attribute.lua`, `globals/index.lua`.
+Полное пошаговое описание расчёта урона по коду: `mechanics/damage_system.lua`, `modifiers/eom_modifier/properties.lua`, `modifiers/eom_modifier/sheet_properties.lua`, `globals/index.lua`.
 
-### Целиком формула — простыми словами
-
-Считаются отдельно **физический**, **магический** и **чистый** урон; в конце три числа складываются — это и есть урон по здоровью.
+Физ, маг и чистый урон считаются **отдельно** на каждом шаге; в конце три числа **складываются** — это итоговый урон по здоровью.
 
 ---
 
-**Шаг 1. База удара**  
-`D0 = Урон_атаки`  
-Это твой урон атаки: база из статов, ловкость в урон, проценты и множители к атаке, усиление игрока, плюс любой плоский бонус к атаке.
+## Порядок шагов (кратко)
+
+1. База удара (урон атаки / способности).
+2. Доп. урон при ударе (проки: плоский + процент).
+3. Плоский исходящий урон (OUTGOING_DAMAGE_BONUS_*).
+4. Крит (множитель по крит урону 1/2/3).
+5. Плоский урон после крита (POST_CRIT бонусы).
+6. Исходящие проценты (физ/маг урон 1/2/3, финальный урон, урон по боссам/элитам).
+7. Предварительная правка у цели (PreAdjust).
+8. Обнуление при промахе/избежании/абсолютный ноль.
+9. Броня / сопротивление магии.
+10. Входящий урон у цели (%).
+11. Финальная правка и блок (Adjust).
+12. Барьер (щит).
 
 ---
 
-**Шаг 2. Доп. урон «при ударе»**  
-Когда по врагу попадает удар, часть предметов и способностей **добавляет к этому удару** ещё урон — плоский (число) или процент от уже нанесённого. Это не «проки», а просто «дополнительный урон при одном ударе».
+## Шаг 1. База удара
 
-`D1 = (D0 + Доп_физ + Доп_маг + Доп_чистый) × (1 + Доп_процент/100)`  
+**Что считается:** Исходный урон одного удара или способности.
 
-- **Доп_физ, Доп_маг, Доп_чистый** — сколько физ/маг/чистого урона **добавляется одним ударом** от предметов и способностей.  
-- **Доп_процент** — процент от текущего урона, который **добавляется этим же ударом** (тоже от предметов/способностей).
+- Для **атаки** — берётся урон атаки героя: база из статов, ловкость в урон, проценты и множители к атаке, усиление игрока (Amplification), плоский бонус (EXTRA, PROC). В коде: `GetAttackDamage()`, в таблицу урона попадает `t.damage` и по типу (PHYSICAL/MAGICAL/PURE) добавляется в `t.physical_damage`, `t.magical_damage` или `t.pure_damage`.
+- Для **способности** — способность передаёт в таблицу урона своё значение и тип.
+
+**Формула (для одного типа, например физ):**
+
+```
+D0_физ = урон_атаки   (если удар физический)
+D0_маг = 0
+D0_чистый = 0
+```
+
+(или наоборот, в зависимости от типа урона.)
+
+**Пояснение:** Это «сырой» урон до любых бонусов, крита и целей. База атаки считается из статов, первичного стата, ловкости (AttackDamagePerAgility), процентов и множителей к атаке.
 
 ---
 
-**Шаг 3. Плоский бонус к исходящему урону**  
-К урону просто прибавляется число (физ/маг/чистый) — это бонусы типа «+X к исходящему урону».
+## Шаг 2. Доп. урон при ударе (проки)
 
-`D2 = D1 + Бонус_исх_физ + Бонус_исх_маг + Бонус_исх_чистый`
+**Что считается:** Предметы и способности добавляют к **этому удару** плоский урон и/или процент от текущего урона. Только для атак (при `isAttack` и не NOT_PROCESSPROCS).
+
+- **Плоский:** PROCATTACK_BONUS_DAMAGE, PROCATTACK_BONUS_DAMAGE_PHYSICAL/MAGICAL/PURE, ADAPTIVE (по типу адаптивного урона атакующего).
+- **Процент:** PROCATTACK_BONUS_DAMAGE_PERCENTAGE — применяется к текущему урону **по типу удара** (физ/маг/чистый).
+
+**Формула (для физ удара):**
+
+```
+D1_физ = D0_физ + плоский_физ + плоский_маг→физ (если конверт) + adaptive (если тип физ)
+D1_физ = D1_физ × (1 + доп_процент/100)
+```
+
+Аналогично для маг и чистого; чистый не умножается на процент проков.
+
+**Пояснение:** «Доп при ударе» — это не отдельный удар, а добавка к одному попаданию. Процент считается от уже увеличенного плоским бонусом значения.
 
 ---
 
-**Шаг 4. Крит**  
-С некоторым шансом удар считается критическим. Тогда урон умножается на **множитель крита**. Если крит не выпал — множитель = 1.
+## Шаг 3. Плоский исходящий урон
 
-`D3 = D2 × Крит_множитель`  
-(при крите — см. ниже; без крита — `Крит_множитель = 1`)
+**Что считается:** Бонусы вида «+X к исходящему урону» — просто прибавляются к физ/маг/чистому.
 
-**Как считается Крит_множитель (где крит урон 1, 2, 3):**
+- OUTGOING_DAMAGE_BONUS_DAMAGE_PHYSICAL, _MAGICAL, _PURE, _ADAPTIVE.
+- INCOMING_DAMAGE_BONUS_DAMAGE у цели здесь не применяется (он позже, вместе с POST_CRIT).
 
-- **Крит_урон_1** — первый бонус к крит урону (в процентах). Складывается с базой крита и с бонусом от команды.
-- **Крит_урон_2** — второй бонус к крит урону (в процентах). Участвует в **цепочке множителей** (перемножается с остальными).
-- **Крит_урон_3** — третий бонус к крит урону (в процентах). Тоже в **цепочке множителей**.
+**Формула:**
 
-Есть ещё **множитель крит 1** и **множитель крит 2** (от команды) — они тоже в цепочке. В коде все эти проценты объединяются через CompoundIncrease (по сути перемножаются как (1 + a/100)(1 + b/100)...). Итоговая формула:
+```
+D2_физ = D1_физ + исх_плоский_физ + adaptive (если физ)
+D2_маг = D1_маг + исх_плоский_маг + adaptive (если маг)
+D2_чистый = D1_чистый + исх_плоский_чистый
+```
 
-`Крит_урон_% = (База_крит_% + Крит_урон_1 + Крит_урон_2_команды + от_цели) × (1 + цепочка_множителей/100)`  
-где в цепочку входят: множитель крит 1, множитель крит 2 команды, **Крит_урон_2**, **Крит_урон_3**.
-
-`Крит_множитель = Крит_урон_% / 100`  
-(например, 200% крит урона → множитель 2)
+**Пояснение:** Все плоские «исходящие» бонусы от атакующего складываются в один шаг до крита.
 
 ---
 
-**Шаг 5. Плоский урон после крита**  
-После того как крит уже применён, к урону снова прибавляют плоские числа — «бонус к урону после крита» от предметов/способностей и «исходящий бонус после крита».
+## Шаг 4. Крит
 
-`D4 = D3 + Посткрит_физ + Посткрит_маг + Посткрит_чистый`
+**Что считается:** С некоторым шансом (PRD по GetCriticalStrikeChance) удар считается критическим. Тогда **весь** текущий урон (физ + маг + чистый по типам) умножается на множитель крита. Если крит не выпал — множитель = 1.
+
+**Крит множитель:**
+
+- **Крит_урон_%** считается так:
+  - **value** (аддитивная часть) = база_крит + CRITICALSTRIKE_DAMAGE + TEAMHERO_CRITICALSTRIKE_DAMAGE + [CRITICALSTRIKE_DAMAGE_TARGET от цели].
+  - **multiple** (цепочка множителей) = CompoundIncrease(CRITICALSTRIKE_DAMAGE_MULTIPLE, TEAMHERO_*, **Крит_урон_2**, **Крит_урон_3**).  
+    CompoundIncrease — это перемножение (1 + a/100)(1 + b/100)... результат в процентах.
+  - **Крит_урон_%** = value × (1 + multiple/100). Опционально ещё × (1 + crit_strength_pct/100) из события.
+- **Крит_множитель** = Крит_урон_% / 100 (например 200% → 2).
+
+**Формула:**
+
+```
+если крит:
+  D3_физ = D2_физ × (Крит_урон_% / 100)
+  D3_маг = D2_маг × (Крит_урон_% / 100)
+  D3_чистый = D2_чистый × (Крит_урон_% / 100)
+иначе:
+  D3_* = D2_*
+```
+
+**Пояснение:** Крит_урон_1 входит в value; Крит_урон_2 и Крит_урон_3 — в цепочку множителей (перемножаются между собой и с множителем крит 1/2 команды).
 
 ---
 
-**Шаг 6. Исходящие проценты урона (физ урон 1/2/3, маг урон 1/2/3, общий урон)**  
-Здесь применяются все «+% к урону» от атакующего. В том числе **отдельно** считаются:
+## Шаг 5. Плоский урон после крита
 
-- **Физ_урон_1** — первый множитель к физическому урону (в %).  
-- **Физ_урон_2** — второй множитель к физическому урону (в %).  
-- **Физ_урон_3** — третий множитель к физическому урону (в %).  
+**Что считается:** После применения крита к урону снова прибавляют плоские бонусы: «бонус к урону после крита» (PROCATTACK_*_POST_CRIT, OUTGOING_DAMAGE_BONUS_*_POST_CRIT, INCOMING_DAMAGE_BONUS_DAMAGE у цели и OUTGOING_DAMAGE_BONUS_DAMAGE у атакующего).
 
-Они перемножаются между собой (и с общим уроном, невидимостью, элитой/боссом и т.д.) через CompoundIncrease. То же для магии:
+**Формула:**
 
-- **Маг_урон_1** — первый множитель к магическому урону (в %).  
-- **Маг_урон_2** — второй множитель к магическому урону (в %).  
-- **Маг_урон_3** — третий множитель к магическому урону (в %).  
+```
+D4_физ = D3_физ + посткрит_плоский_физ
+D4_маг = D3_маг + посткрит_плоский_маг
+D4_чистый = D3_чистый + посткрит_плоский_чистый
+```
 
-Для физического удара используется итоговый процент по физ ветке (физ 1, 2, 3 + общий урон и прочее), для магического — по маг ветке.
-
-`D5 = D4 × (1 + Исходящий_процент/100)`  
-
-**Исходящий_процент** для физ = сложить все аддитивные проценты к физ урону, потом перемножить множители: общий урон, **Физ_урон_1**, **Физ_урон_2**, **Физ_урон_3** (и команда, невидимость, цель и т.д.). Для маг — то же с **Маг_урон_1**, **Маг_урон_2**, **Маг_урон_3**.
+**Пояснение:** Эти бонусы не усиливаются критом — они просто добавляются к уже «прокраченному» урону.
 
 ---
 
-**Шаг 7. Предварительная правка урона у цели**  
-Цель может уменьшить урон до расчёта брони (например, способности «уменьшить входящий урон на X»).
+## Шаг 6. Исходящие проценты урона (физ/маг урон 1/2/3, финальный, по боссам/элитам)
 
-`D6 = D5 + PreAdjust`  
-(может быть отрицательным — урон снижается). Дальше: если есть «полный ноль урона», промах или избежание — урон обнуляется.
+**Что считается:** Все «+% к урону» от атакующего. Считаются отдельно для физ и маг; чистый урон этим шагом не умножается (в коде чистый не участвует в allMore/physicalMore/magicalMore).
+
+В коде:
+- **allIncrease** = OUTGOING_DAMAGE_PERCENTAGE + TEAMHERO_* (аддитивно).
+- **physicalIncrease** = OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE + TEAMHERO_* (аддитивно).
+- **allMore** = цепочка множителей: OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE, TEAMHERO_*, **FINAL_DAMAGE** (финальный урон), плюс при цели-элите — **урон по элитам**, при цели-боссе — **урон по боссам**, иначе — **урон по обычным**, плюс при необходимости: тренировка (npc_gold_*), невидимость, контратака, призыв, дамаг-иммун.
+- **physicalMore** = OUTGOING_PHYSICAL_*_MULTIPLE, TEAMHERO_*, **OUTGOING_PHYSICAL_*_2** (Физ_урон_2), **OUTGOING_PHYSICAL_*_3** (Физ_урон_3).
+- **magicalMore** = то же для маг (Маг_урон_1/2/3).
+
+Итоговый множитель для физ: `(1 + CompoundIncrease(allIncrease + physicalIncrease, allMore, physicalMore) / 100)`. Для маг — с magicalIncrease и magicalMore.
+
+**Формула:**
+
+```
+множитель_физ = 1 + CompoundIncrease(allIncrease + physicalIncrease, allMore, physicalMore) / 100
+множитель_маг = 1 + CompoundIncrease(allIncrease + magicalIncrease, allMore, magicalMore) / 100
+
+D5_физ = D4_физ × множитель_физ
+D5_маг = D4_маг × множитель_маг
+D5_чистый = D4_чистый
+```
+
+**Пояснение:** Физ_урон_1 — это OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE (и команда). Физ_урон_2 и Физ_урон_3 — отдельные свойства, все перемножаются. Финал урон (FINAL_DAMAGE) и урон по боссам/элитам/обычным входят в allMore и применяются ко всем типам (физ и маг).
 
 ---
 
-**Шаг 8. Броня / сопротивление**  
-Урон уменьшается от брони цели (физ) или сопротивления магии (маг).
+## Шаг 7. Предварительная правка у цели (PreAdjust)
 
-`D7 = D6 × (1 − Снижение_от_брони)`
+**Что считается:** Цель может изменить входящий урон **до** расчёта брони: PRE_PHYSICAL_DAMAGE_ADJUST, PRE_MAGICAL_DAMAGE_ADJUST, PRE_DAMAGE_ADJUST. Значения прибавляются к соответствующему типу урона (могут быть отрицательными).
+
+**Формула:**
+
+```
+D6_физ = D5_физ + PreAdjust_физ
+D6_маг = D5_маг + PreAdjust_маг
+D6_чистый = D5_чистый + PreAdjust_общий (по типу удара)
+```
+
+**Пояснение:** Используется для способностей вида «уменьшить входящий урон на X» до учёта брони.
 
 ---
 
-**Шаг 9. Входящий урон у цели (%)**  
-Цель может получать больше или меньше урона в процентах (снижение урона, уязвимость и т.д.).
+## Шаг 8. Обнуление: абсолютный ноль, промах, избежание
 
-`D8 = D7 × (1 + Входящий_процент/100)`
+**Что считается:** В некоторых условиях урон обнуляется.
 
----
+- ABSOLUTE_NO_DAMAGE_PHYSICAL/MAGICAL/PURE у цели — полный ноль по этому типу.
+- MISS_DAMAGE у атакующего — весь урон 0.
+- AVOID_DAMAGE у цели — весь урон 0.
 
-**Шаг 10. Финальная правка и блок**  
-Прибавляется/вычитается финальная правка по типу урона (физ/маг) и общий DAMAGE_ADJUST (например, блок от ловкости — вычитается из урона).
+**Формула:** После этого шага соответствующие D7_* либо остаются как D6_*, либо становятся 0.
 
-`D9 = D8 + Adjust`
-
----
-
-**Шаг 11. Барьер (щит)**  
-Щит поглощает часть урона — это отрицательная добавка к итогу.
-
-`D10 = D9 + Барьер`  
-(Барьер обычно отрицательный — итоговый урон уменьшается.)
+**Пояснение:** Промах и избежание обнуляют всё; «абсолютный ноль» — только по выбранному типу урона.
 
 ---
 
-**Итог по здоровью:**  
-`УРОН = D10` (физический + магический + чистый считаются отдельно по шагам 1–11, потом три числа складываются).
+## Шаг 9. Броня и сопротивление магии
+
+**Что считается:** Физ урон уменьшается от **брони** цели, маг урон — от **сопротивления магии**. В коде для обоих используется один и тот же фактор `remaining = 1 - GetArmorDamageReduction(t.victim, t)` (т.е. сопротивление считается через ту же систему). Игнор брони/маг брони (флаги урона) может отключить применение.
+
+**Формула:**
+
+```
+снижение = GetArmorDamageReduction(цель)   // в долях (0..1)
+remaining = 1 - снижение
+
+D8_физ = D7_физ × remaining   (если не IGNORE_PHYSICAL_ARMOR)
+D8_маг = D7_маг × remaining   (если не IGNORE_MAGIC_ARMOR)
+D8_чистый = D7_чистый
+```
+
+**Пояснение:** Чистый урон броней и сопротивлением не уменьшается. Броня и маг. сопротивление в игре дают один общий фактор снижения для физ и маг.
 
 ---
 
-**Одна строка (где что стоит):**  
+## Шаг 10. Входящий урон у цели (%)
 
-**УРОН = ( ( ( (Удар_база + Доп_урон_при_ударе)×(1+Доп_%) + Бонус_исх ) × Крит_множитель + Посткрит_плоский ) × (1 + Исходящий_%) + PreAdjust ) × (1 − Броня) × (1 + Входящий_%) + Adjust + Барьер**
+**Что считается:** Цель может получать больше или меньше урона в процентах: INCOMING_DAMAGE_PERCENTAGE, INCOMING_PHYSICAL_DAMAGE_PERCENTAGE, INCOMING_MAGICAL_DAMAGE_PERCENTAGE. В коде: физ умножается на (1 + incoming_physical/100) и на (1 + incoming_all/100), маг — на (1 + incoming_magical/100) и на (1 + incoming_all/100).
 
-- **Крит_множитель** = 1 без крита; при крите = (База_крит + **Крит_урон_1** + …) × (1 + **Крит_урон_2**, **Крит_урон_3**, множители крит 1/2)/100.  
-- **Исходящий_%** для физ = цепочка с **Физ_урон_1**, **Физ_урон_2**, **Физ_урон_3**; для маг = **Маг_урон_1**, **Маг_урон_2**, **Маг_урон_3**.
+**Формула:**
+
+```
+D9_физ = D8_физ × (1 + входящий_физ_%/100) × (1 + входящий_общий_%/100)
+D9_маг = D8_маг × (1 + входящий_маг_%/100) × (1 + входящий_общий_%/100)
+D9_чистый = D8_чистый × (1 + входящий_общий_%/100)
+```
+
+**Пояснение:** Уязвимость и снижение входящего урона задаются у цели и применяются после брони.
 
 ---
 
-## 1. Вспомогательные функции
+## Шаг 11. Финальная правка и блок (Adjust)
 
-### CompoundIncrease(a, b, c, ...)
+**Что считается:** Прибавляется/вычитается финальная правка по типу: PHYSICAL_DAMAGE_ADJUST, MAGICAL_DAMAGE_ADJUST, DAMAGE_ADJUST (общий, например блок от ловкости). В коде через DamageAdjust по типу удара распределяется change по физ/маг/чистый.
 
-Множественное мультипликативное сложение процентов (все значения в %):
-
-```
-V = a
-V = ((1 + V/100) * (1 + b/100) - 1) * 100
-V = ((1 + V/100) * (1 + c/100) - 1) * 100
-...
-return V
-```
-
-Эквивалент: итоговый процент от последовательного применения множителей `(1 + a/100)(1 + b/100)(1 + c/100)... - 1` в процентах.
-
-### CompoundIncreaseSimple(a, b)
-
-Один шаг:
+**Формула:**
 
 ```
-return ((1 + a/100) * (1 + b/100) - 1) * 100
+D10_физ = D9_физ + Adjust_физ
+D10_маг = D9_маг + Adjust_маг
+D10_чистый = D9_чистый + Adjust_по_типу
 ```
+
+**Пояснение:** Блок (например от ловкости) обычно даёт отрицательный Adjust, уменьшая итоговый урон.
 
 ---
 
-## 2. Базовый урон атаки (Attack Damage)
+## Шаг 12. Барьер (щит)
 
-**Файлы:** `modifiers/eom_modifier/properties.lua` — `GetBaseAttackDamage`, `GetAttackDamage`.
+**Что считается:** Щит поглощает часть урона: PHYSICAL_DAMAGE_BARRIER, MAGICAL_DAMAGE_BARRIER, DAMAGE_BARRIER. Значения прибавляются к урону (обычно отрицательные — уменьшение). Распределение по типам через DamageAdjust по типу удара.
 
-### 2.1 База атаки (GetBaseAttackDamage)
-
-```
-value = BaseAttackDamage (KV)
-      + ATTACK_DAMAGE (модификаторы)
-      + TEAMHERO_ATTACK_DAMAGE
-      + GetBaseAttackDamageStats(hUnit)   // ловкость → урон: Agility * GetAttackDamagePerAgility
-
-addition = ATTACK_DAMAGE_PERCENTAGE + TEAMHERO_ATTACK_DAMAGE_PERCENTAGE
-multiple = ATTACK_DAMAGE_PERCENTAGE_MULTIPLE
-
-BaseAttackDamage = value * (1 + addition/100) * (1 + multiple/100)
-```
-
-Герой из `modifier_hero_attribute`:  
-`ATTACK_DAMAGE_STATS = Agility * GetAttackDamagePerAgility`.
-
-### 2.2 Итоговый урон атаки (GetAttackDamage)
+**Формула:**
 
 ```
-AttackDamageAmplification = PLAYER_ATTACK_DAMAGE_AMPLIFICATION * (1 + GetAttackDamageAmplification2/100)
-
-GetAttackDamage = BaseAttackDamage * (1 + AttackDamageAmplification/100)
-                + ATTACK_DAMAGE_EXTRA
-                + ATTACK_DAMAGE_PROC   // только при атаке с record
+D11_физ = D10_физ + Барьер_физ
+D11_маг = D10_маг + Барьер_маг
+D11_чистый = D10_чистый + Барьер_по_типу
 ```
 
-Итого: **база** (в т.ч. от силы/ловкости/инта и процентов/множителей) × усиление игрока + доп. плоский урон и прочие бонусы.
+**Пояснение:** Барьер не может увеличить урон — он только уменьшает (или 0). Итоговый урон по здоровью не может стать отрицательным (это обрабатывается в DealDamage).
 
 ---
 
-## 3. Крит: шанс и множитель
-
-**Файлы:** `modifiers/eom_modifier/properties.lua` — `GetCriticalStrikeChance`, `GetCriticalStrikeDamage`, `GetCriticalstrikeDamage2`.
-
-### 3.1 Шанс крита (GetCriticalStrikeChance)
+## Итог по здоровью
 
 ```
-value = OriginalValue("CritChance") 
-      + CRITICALSTRIKE_CHANCE 
-      + TEAMHERO_CRITICALSTRIKE_CHANCE
-      [+ CRITICALSTRIKE_CHANCE_TARGET если есть target]
-
-mul = CRITICALSTRIKE_CHANCE_MULTIPLE
-fixed = FIXED_CRITICALSTRIKE_CHANCE
-
-Chance = (value * (1 + mul/100)) с учётом fixed (максимум из value и fixed)
+ИТОГОВЫЙ_УРОН = D11_физ + D11_маг + D11_чистый
 ```
 
-Проверка крита в уроне: **PRD** по шансу `GetCriticalStrikeChance(attacker, t)` (псевдо-рандом).
-
-### 3.2 Крит урон 1 (GetCriticalStrikeDamage)
-
-```
-value = OriginalValue("CritDamage") 
-      + CRITICALSTRIKE_DAMAGE 
-      + TEAMHERO_CRITICALSTRIKE_DAMAGE
-      [+ CRITICALSTRIKE_DAMAGE_TARGET если есть target]
-
-multiple = CompoundIncrease(
-    CRITICALSTRIKE_DAMAGE_MULTIPLE,
-    TEAMHERO_CRITICALSTRIKE_DAMAGE_MULTIPLE,
-    GetCriticalstrikeDamage2(unit),      // крит 2
-    CRITICALSTRIKE_DAMAGE_3              // крит 3
-)
-[+ CRITICALSTRIKE_DAMAGE_TARGET_MULTIPLE от цели]
-
-CritDamage% = value * (1 + multiple/100) * (1 + crit_strength/100)
-```
-
-В **damage_system** при срабатывании крита:
-
-```lua
-crit = GetCriticalStrikeDamage(attacker, t) / 100
-if t.crit_strength_pct and t.crit_strength_pct > 0 then
-    crit = crit * (1 + t.crit_strength_pct/100)
-end
-t.damage = t.damage * crit
-t.physical_damage = t.physical_damage * crit
-t.magical_damage = t.magical_damage * crit
-```
-
-То есть **крит множитель** = `CritDamage% / 100` (и опционально × усиление крита из события).
-
-### 3.3 Крит урон 2 и 3
-
-- **Крит 2:**  
-  `GetCriticalstrikeDamage2 = CRITICALSTRIKE_DAMAGE_2 + TEAMHERO_CRITICALSTRIKE_DAMAGE_2`  
-  подставляется в `CompoundIncrease` при расчёте `multiple` для крит урона.
-
-- **Крит 3:**  
-  `CRITICALSTRIKE_DAMAGE_3` — последний аргумент в том же `CompoundIncrease`.
-
-Итого: **крит урон** = база крит% + крит 1 + крит 2 (и team) + крит 3, все множители (включая MULTIPLE и target) комбинируются через **CompoundIncrease**.
+Это значение передаётся в DealDamage и вычитается из здоровья цели (с учётом NON_LETHAL и т.д.).
 
 ---
 
-## 4. Исходящий урон: физ / маг (проценты и множители)
+# Пример расчёта (числовой)
 
-**Файлы:** `modifiers/eom_modifier/properties.lua` — `GetOutgoingPhysicalDamagePercent`, `GetOutgoingMagicalDamagePercent`; применение в `mechanics/damage_system.lua`.
+Рассмотрим **один физический удар** по обычному врагу (не босс, не элит). Упростим: только физ урон, без конвертов и адаптива.
 
-Урон разделяется на **physical_damage**, **magical_damage**, **pure_damage**. Для каждого типа считаются свои аддитивные проценты и мультипликативные слои.
+**Исходные данные (придуманные):**
 
-### 4.1 Физ урон (Outgoing Physical)
+- Урон атаки: **200**
+- Доп при ударе (прок): плоский **+10**, процент **+5%**
+- Исходящий плоский: **+20**
+- Крит выпал, Крит_урон_% = **200%**
+- Посткрит плоский: **0**
+- Исходящие проценты: allIncrease = 10, physicalIncrease = 20, allMore = 20 (в т.ч. финал урон), physicalMore = 10 (физ 2/3). CompoundIncrease(10+20, 20, 10) = допустим получилось **48%** (пример: (1+0.3)*(1+0.2)*(1+0.1)-1 ≈ 0.716 → 71.6%, возьмём для примера 48).
+- PreAdjust: **0**
+- Броня цели: снижение **20%** → remaining = **0.8**
+- Входящий у цели: **0%**
+- Adjust (блок): **-15**
+- Барьер: **0**
 
-**Addition (слагаемые в %):**
+**Пошагово:**
 
-- OUTGOING_DAMAGE_PERCENTAGE + TEAMHERO
-- INVISIBILITY_DAMAGE_PERCENTAGE (если невидим)
-- DAMAGE_IMMUNE_DAMAGE_PERCENTAGE (если в имьюне)
-- OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE + TEAMHERO
+| Шаг | Формула | Результат |
+|-----|---------|------------|
+| 1. База удара | D0_физ = 200 | **200** |
+| 2. Доп при ударе | D1 = (200+10)×(1+5/100) = 210×1.05 | **220.5** |
+| 3. Исходящий плоский | D2 = 220.5 + 20 | **240.5** |
+| 4. Крит | D3 = 240.5 × (200/100) | **481** |
+| 5. Посткрит плоский | D4 = 481 + 0 | **481** |
+| 6. Исходящие % | множитель = 1 + 48/100 = 1.48; D5 = 481 × 1.48 | **711.88** |
+| 7. PreAdjust | D6 = 711.88 + 0 | **711.88** |
+| 8. Обнуление | нет | **711.88** |
+| 9. Броня | D8 = 711.88 × 0.8 | **569.504** |
+| 10. Входящий % | D9 = 569.504 × 1 × 1 | **569.504** |
+| 11. Adjust | D10 = 569.504 + (-15) | **554.504** |
+| 12. Барьер | D11 = 554.504 + 0 | **554.504** |
+| **Итог** | Урон по здоровью | **≈ 554.5** (физ; маг и чистый = 0) |
 
-**Multiple (слои множителей через CompoundIncrease):**
-
-- OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE
-- TEAMHERO_OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE
-- INVISIBILITY_DAMAGE_PERCENTAGE_MULTIPLE
-- DAMAGE_IMMUNE_DAMAGE_PERCENTAGE_MULTIPLE
-- OUTGOING_DAMAGE_PERCENTAGE_PER_FAITH_MULTIPLE
-- FINAL_DAMAGE
-- **OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE** (физ 1)
-- TEAMHERO_OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE
-- **OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_2** + TEAMHERO (физ 2)
-- **OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_3** (физ 3)
-
-Итог:  
-`physical_mult = 1 + CompoundIncreaseSimple(addition, multiple)/100`  
-В damage_system:  
-`t.physical_damage = t.physical_damage * physical_mult`.
-
-### 4.2 Маг урон (Outgoing Magical)
-
-Аналогично: свои **OUTGOING_MAGICAL_DAMAGE_PERCENTAGE** и **OUTGOING_MAGICAL_DAMAGE_PERCENTAGE_2/3**, TEAMHERO, невидимость, имьюн, вера, FINAL_DAMAGE.  
-`magical_mult = 1 + CompoundIncreaseSimple(addition, multiple)/100`  
-В damage_system:  
-`t.magical_damage = t.magical_damage * magical_mult`.
-
-### 4.3 Общий множитель урона в damage_system
-
-В `DamageProcess` для физ/маг используется одна и та же схема:
-
-```
-allIncrease = OUTGOING_DAMAGE_PERCENTAGE + TEAMHERO
-physicalIncrease = OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE + TEAMHERO
-magicalIncrease = OUTGOING_MAGICAL_DAMAGE_PERCENTAGE + TEAMHERO
-
-allMore = CompoundIncrease(
-    OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE,
-    TEAMHERO_OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE,
-    FINAL_DAMAGE
-)
-+ при summoned: GetSummonedDamage
-+ при retaliated: COUNTER_DAMAGE_PERCENTAGE и MULTIPLE
-+ по цели: training / elite / boss / normal enemy
-+ невидимость, damage immune
-```
-
-```
-physicalMore = CompoundIncrease(
-    OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE,
-    TEAMHERO_OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE,
-    OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_2 + TEAMHERO,
-    OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_3
-)
-magicalMore = CompoundIncrease(
-    OUTGOING_MAGICAL_DAMAGE_PERCENTAGE_MULTIPLE,
-    TEAMHERO,
-    OUTGOING_MAGICAL_DAMAGE_PERCENTAGE_2 + TEAMHERO,
-    OUTGOING_MAGICAL_DAMAGE_PERCENTAGE_3
-)
-```
-
-```
-physical = 1 + CompoundIncrease(allIncrease + physicalIncrease, allMore, physicalMore) / 100
-magical  = 1 + CompoundIncrease(allIncrease + magicalIncrease, allMore, magicalMore) / 100
-
-t.physical_damage *= physical
-t.magical_damage  *= magical
-```
-
-То есть: **физ урон 1** — первый слой множителя физ урона, **физ 2** и **физ 3** — следующие слои в **CompoundIncrease**; то же для маг урона 1/2/3.
+Итого: при атаке **200**, с проком +10 и +5%, с исходящим +20, с критом 200%, с исходящим % в сумме 48%, при броне 20%, блоке 15 — **итоговый урон по здоровью ≈ 554.5**.
 
 ---
 
-## 5. Порядок применения в DamageProcess (кратко)
-
-1. **Тип урона:** physical / magical / pure, конверсии физ↔маг.
-2. **Проки атаки (proc):** бонусы к урону до крита (BONUS_DAMAGE, BONUS_DAMAGE_PHYSICAL/MAGICAL/PURE, ADAPTIVE, процент).
-3. **Бонусы исходящего урона до крита:** OUTGOING_DAMAGE_BONUS_DAMAGE_PHYSICAL/MAGICAL/PURE, ADAPTIVE, конверсии.
-4. **Крит:** проверка PRD по шансу → при крите умножение physical/magical/pure на `GetCriticalStrikeDamage(...)/100` (и crit_strength_pct при наличии).
-5. **Пост-крит бонусы:** PROCATTACK_BONUS_DAMAGE_POST_CRIT, OUTGOING_DAMAGE_BONUS_*_POST_CRIT, INCOMING_DAMAGE_BONUS и т.д.
-6. **Source/Damage amplify:** все слои **allMore**, **physicalMore**, **magicalMore** (включая физ 1/2/3, маг 1/2/3, крит 1/2/3 в своих формулах выше).
-7. **Входящие модификаторы цели:** PRE_*_ADJUST, DAMAGE_ADJUST, барьеры, броня, INCOMING_*_PERCENTAGE, и т.д.
-8. **Итог:** `t.damage = t.physical_damage + t.magical_damage + t.pure_damage`, затем DealDamage по здоровью.
-
----
-
-## 6. Сводка свойств (имена в коде)
-
-| Описание              | Property (примеры) |
-|-----------------------|--------------------|
-| База атаки            | ATTACK_DAMAGE, ATTACK_DAMAGE_STATS (агility), ATTACK_DAMAGE_PERCENTAGE, ATTACK_DAMAGE_PERCENTAGE_MULTIPLE |
-| Урон атаки итог       | GetAttackDamage = Base * (1 + Amplification/100) + EXTRA + PROC |
-| Шанс крита            | CRITICALSTRIKE_CHANCE, TEAMHERO_*, CRITICALSTRIKE_CHANCE_TARGET, FIXED_*, CRITICALSTRIKE_CHANCE_MULTIPLE |
-| Крит урон 1           | CRITICALSTRIKE_DAMAGE, TEAMHERO_*, CRITICALSTRIKE_DAMAGE_MULTIPLE, CRITICALSTRIKE_DAMAGE_TARGET* |
-| Крит урон 2           | CRITICALSTRIKE_DAMAGE_2, TEAMHERO_CRITICALSTRIKE_DAMAGE_2 |
-| Крит урон 3           | CRITICALSTRIKE_DAMAGE_3 |
-| Физ урон (слои)       | OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_MULTIPLE (физ 1), OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_2 (физ 2), OUTGOING_PHYSICAL_DAMAGE_PERCENTAGE_3 (физ 3) + TEAMHERO |
-| Маг урон (слои)       | OUTGOING_MAGICAL_DAMAGE_PERCENTAGE_MULTIPLE (маг 1), _2 (маг 2), _3 (маг 3) + TEAMHERO |
-| Общий урон            | OUTGOING_DAMAGE_PERCENTAGE, OUTGOING_DAMAGE_PERCENTAGE_MULTIPLE, FINAL_DAMAGE, вера, невидимость, имьюн, элита/босс/обычный враг |
-
-Все множители типа «*_MULTIPLE» и слои «*_2», «*_3» комбинируются через **CompoundIncrease** (последовательно в процентах). Итоговый удар по цели: **база атаки** → **проки** → **крит** → **пост-крит** → **исходящие % (физ/маг 1–3 и общие)** → **входящие и броня** → финальный **damage**.
+**Источники в коде:**  
+`mechanics/damage_system.lua` (порядок шагов и вызовы), `modifiers/eom_modifier/properties.lua` (GetCriticalStrikeDamage, GetOutgoingPhysicalDamagePercent и т.д.), `modifiers/eom_modifier/sheet_properties.lua` (имена свойств), `globals/index.lua` (CompoundIncrease).
